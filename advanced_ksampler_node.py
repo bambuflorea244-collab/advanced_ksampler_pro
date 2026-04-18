@@ -1,0 +1,381 @@
+# -*- coding: utf-8 -*-
+"""
+Advanced KSampler PRO - Custom ComfyUI Node
+Generare noise structurat + control strict al metricilor de calitate
+"""
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+import comfy.sample
+import comfy.samplers
+import comfy.utils
+from comfy import model_management
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NOISE GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_structured_noise(shape, seed, sigma, flatness, wavelet_energy, skewness, device):
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+
+    noise = torch.randn(shape, generator=gen, device=device)
+
+    if abs(skewness) > 0.01:
+        alpha = skewness * 0.08
+        noise = noise + alpha * (noise ** 2 - 1.0)
+
+    if abs(flatness - 1.0) > 0.03:
+        fft = torch.fft.rfft2(noise)
+        mag = torch.abs(fft)
+        phase = torch.angle(fft)
+        h, w_r = fft.shape[-2], fft.shape[-1]
+        fy = torch.fft.fftfreq(h, device=device).reshape(-1, 1)
+        fx = torch.fft.rfftfreq(noise.shape[-1], device=device).reshape(1, -1)
+        freq = torch.sqrt(fy ** 2 + fx ** 2 + 1e-9)
+        weight = freq ** (flatness - 1.0)
+        weight = weight / (weight.mean() + 1e-9)
+        mag = mag * weight.unsqueeze(0).unsqueeze(0)
+        fft_adj = torch.polar(mag, phase)
+        noise = torch.fft.irfft2(fft_adj, s=noise.shape[-2:])
+
+    if abs(wavelet_energy - 1.0) > 0.03 and noise.shape[-1] >= 4:
+        low = F.avg_pool2d(noise, 2, 2, ceil_mode=True)
+        low_up = F.interpolate(low, size=noise.shape[-2:], mode='bilinear', align_corners=False)
+        high = noise - low_up
+        noise = low_up + high * wavelet_energy
+
+    std = noise.std()
+    if std > 1e-9:
+        noise = noise * (sigma / std)
+
+    return noise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  METRICI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_metrics(img_tensor):
+    img_np = img_tensor.cpu().float().numpy()
+    img_255 = img_np * 255.0
+
+    lum = 0.299 * img_255[..., 0] + 0.587 * img_255[..., 1] + 0.114 * img_255[..., 2]
+    lum_mean = float(lum.mean())
+    lum_std  = float(lum.std())
+    total    = float(lum.size)
+    burned   = float((lum > 250).sum() / total * 100.0)
+    crushed  = float((lum < 5).sum()   / total * 100.0)
+
+    r_sig = float(img_255[..., 0].std())
+    g_sig = float(img_255[..., 1].std())
+    b_sig = float(img_255[..., 2].std())
+
+    lum_t = torch.tensor(lum / 255.0, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+    lap_k = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    laplacian_map = F.conv2d(lum_t, lap_k, padding=1)
+    lap_var = float(laplacian_map.var() * 1e6)
+
+    sx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    sy = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    gx = F.conv2d(lum_t, sx, padding=1)
+    gy = F.conv2d(lum_t, sy, padding=1)
+    grad_mean  = float(torch.sqrt(gx**2 + gy**2).mean() * 255.0)
+    tenengrad  = float((gx**2 + gy**2).mean() * 255.0 * 255.0)
+    sharpness  = tenengrad
+
+    sig_pwr   = float((lum_t ** 2).mean()) + 1e-9
+    noise_pwr = float(laplacian_map.std())  + 1e-9
+    snr_db    = float(10.0 * np.log10(sig_pwr / (noise_pwr ** 2 + 1e-9)))
+
+    hist, _ = np.histogram(lum.flatten(), bins=256, range=(0, 256))
+    p = hist / (hist.sum() + 1e-9)
+    entropy_hist = float(-np.sum(p * np.log2(p + 1e-9)))
+
+    hist2, _ = np.histogram(img_np.flatten(), bins=64, range=(0, 1))
+    p2 = hist2 / (hist2.sum() + 1e-9)
+    entropy_img = float(-np.sum(p2 * np.log2(p2 + 1e-9)))
+
+    try:
+        from scipy.fft import dctn
+        dct_map = dctn(lum / 255.0, norm='ortho')
+        h, w = dct_map.shape
+        hf_mask = np.zeros((h, w), dtype=bool)
+        hf_mask[h//2:, :] = True
+        hf_mask[:, w//2:] = True
+        total_e = float((dct_map**2).sum())
+        hf_e    = float((dct_map[hf_mask]**2).sum())
+        dct_pct = float(hf_e / (total_e + 1e-9) * 100.0)
+    except Exception:
+        dct_pct = 0.0
+
+    img_sigma = float(img_np.std() * 255.0)
+
+    return dict(
+        lum_mean=lum_mean, lum_std=lum_std,
+        burned=burned, crushed=crushed,
+        r_sig=r_sig, g_sig=g_sig, b_sig=b_sig,
+        lap_var=lap_var, grad_mean=grad_mean,
+        tenengrad=tenengrad, sharpness=sharpness,
+        snr_db=snr_db, entropy_hist=entropy_hist,
+        entropy_img=entropy_img, dct_pct=dct_pct,
+        img_sigma=img_sigma,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POST-PROCESARE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def enforce_luminance(img, target_mean, target_std):
+    img = img.clone()
+    lum = 0.299*img[...,0] + 0.587*img[...,1] + 0.114*img[...,2]
+    cur_mean = lum.mean()
+    cur_std  = lum.std()
+    if cur_std > 1e-6:
+        scale = (target_std / 255.0) / cur_std
+        shift = (target_mean / 255.0) - cur_mean * scale
+        img = img * scale + shift
+    return torch.clamp(img, 0.0, 1.0)
+
+
+def enforce_color_balance(img, target_r, target_g, target_b):
+    img = img.clone()
+    for ch, tgt in enumerate([target_r, target_g, target_b]):
+        if tgt <= 0:
+            continue
+        ch_data = img[..., ch]
+        cur_std  = ch_data.std() * 255.0
+        if cur_std > 1e-6:
+            scale = tgt / cur_std
+            mean  = ch_data.mean()
+            img[..., ch] = (ch_data - mean) * scale + mean
+    return torch.clamp(img, 0.0, 1.0)
+
+
+def enforce_sharpness(img, target_tenengrad):
+    img = img.clone()
+    lum_t = (0.299*img[...,0] + 0.587*img[...,1] + 0.114*img[...,2]).unsqueeze(0).unsqueeze(0)
+    sx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(img.device)
+    sy = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(img.device)
+    gx = F.conv2d(lum_t, sx, padding=1)
+    gy = F.conv2d(lum_t, sy, padding=1)
+    cur_ten = float((gx**2 + gy**2).mean() * 65025.0)
+
+    if cur_ten < 1e-6:
+        return img
+
+    ratio = (target_tenengrad / cur_ten) ** 0.5
+    ratio = float(np.clip(ratio, 0.5, 3.0))
+
+    if ratio > 1.05:
+        img_perm = img.permute(2, 0, 1).unsqueeze(0)
+        blur = F.avg_pool2d(img_perm, 3, stride=1, padding=1)
+        sharpened = img_perm + (img_perm - blur) * (ratio - 1.0)
+        img = sharpened.squeeze(0).permute(1, 2, 0)
+    elif ratio < 0.95:
+        img_perm = img.permute(2, 0, 1).unsqueeze(0)
+        blurred = F.avg_pool2d(img_perm, 3, stride=1, padding=1)
+        img = (img_perm * ratio + blurred * (1 - ratio)).squeeze(0).permute(1, 2, 0)
+
+    return torch.clamp(img, 0.0, 1.0)
+
+
+def enforce_burned_crushed(img, max_burned_pct, max_crushed_pct):
+    img = img.clone()
+    lum = 0.299*img[...,0] + 0.587*img[...,1] + 0.114*img[...,2]
+    burned  = float((lum > 0.98).float().mean() * 100.0)
+    crushed = float((lum < 0.02).float().mean() * 100.0)
+
+    gamma = 1.0
+    if max_burned_pct > 0 and burned > max_burned_pct:
+        gamma *= 1.0 + (burned - max_burned_pct) * 0.02
+    if max_crushed_pct > 0 and crushed > max_crushed_pct:
+        gamma *= 1.0 - (crushed - max_crushed_pct) * 0.02
+
+    gamma = float(np.clip(gamma, 0.5, 2.0))
+    if abs(gamma - 1.0) > 0.005:
+        img = torch.pow(torch.clamp(img, 1e-8, 1.0), gamma)
+
+    return torch.clamp(img, 0.0, 1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NODUL PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AdvancedKSamplerPRO:
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model":         ("MODEL",),
+                "positive":      ("CONDITIONING",),
+                "negative":      ("CONDITIONING",),
+                "latent_image":  ("LATENT",),
+                "vae":           ("VAE",),
+
+                "seed":          ("INT",   {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "steps":         ("INT",   {"default": 20, "min": 1, "max": 200}),
+                "cfg":           ("FLOAT", {"default": 7.0, "min": 1.0, "max": 30.0, "step": 0.1}),
+                "sampler_name":  (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler":     (comfy.samplers.KSampler.SCHEDULERS,),
+                "denoise":       ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+
+                "noise_sigma":    ("FLOAT", {"default": 2.680, "min": 0.001, "max": 20.0,   "step": 0.001, "tooltip": "Deviatie standard globala a noise-ului initial"}),
+                "noise_flatness": ("FLOAT", {"default": 1.197, "min": 0.1,   "max": 5.0,    "step": 0.001, "tooltip": "Spectral flatness: 1=white, <1=pink/brown, >1=blue noise"}),
+                "noise_wavelet":  ("FLOAT", {"default": 2.965, "min": 0.1,   "max": 10.0,   "step": 0.001, "tooltip": "Energia componentelor high-freq (wavelet HF)"}),
+                "noise_skewness": ("FLOAT", {"default": 1.640, "min": -5.0,  "max": 5.0,    "step": 0.001, "tooltip": "Asimetria distributiei noise-ului"}),
+
+                "target_sharpness":  ("FLOAT", {"default": 1295.2, "min": 0.0, "max": 50000.0, "step": 0.1}),
+                "target_tenengrad":  ("FLOAT", {"default": 2584.3, "min": 0.0, "max": 50000.0, "step": 0.1}),
+                "target_laplacian":  ("FLOAT", {"default": 6.2,    "min": 0.0, "max": 5000.0,  "step": 0.01}),
+                "target_gradient":   ("FLOAT", {"default": 18.7,   "min": 0.0, "max": 500.0,   "step": 0.01}),
+
+                "target_snr_db":     ("FLOAT", {"default": 37.8,  "min": 0.0,  "max": 100.0, "step": 0.1}),
+                "target_brisque":    ("FLOAT", {"default": 0.103, "min": 0.0,  "max": 1.0,   "step": 0.001, "tooltip": "0=perfect, 1=very bad (informativ)"}),
+                "target_ssim":       ("FLOAT", {"default": 0.894, "min": 0.0,  "max": 1.0,   "step": 0.001}),
+                "target_entropy":    ("FLOAT", {"default": 1.11,  "min": 0.0,  "max": 8.0,   "step": 0.01}),
+                "target_dct_pct":    ("FLOAT", {"default": 9.7,   "min": 0.0,  "max": 100.0, "step": 0.1,  "tooltip": "% energie DCT in HF"}),
+                "target_compress":   ("FLOAT", {"default": 0.0,   "min": 0.0,  "max": 1.0,   "step": 0.001}),
+
+                "color_r_sigma": ("FLOAT", {"default": 2.965, "min": 0.0, "max": 255.0, "step": 0.001, "tooltip": "Sigma canalului R (0=nu schimba)"}),
+                "color_g_sigma": ("FLOAT", {"default": 2.965, "min": 0.0, "max": 255.0, "step": 0.001}),
+                "color_b_sigma": ("FLOAT", {"default": 2.965, "min": 0.0, "max": 255.0, "step": 0.001}),
+
+                "lum_mean":          ("FLOAT", {"default": 199.2, "min": 0.0,   "max": 255.0, "step": 0.1}),
+                "lum_std":           ("FLOAT", {"default": 56.2,  "min": 0.0,   "max": 128.0, "step": 0.1}),
+                "max_burned_pct":    ("FLOAT", {"default": 0.01,  "min": 0.0,   "max": 100.0, "step": 0.01, "tooltip": "% maxim pixeli arsi (>250)"}),
+                "max_crushed_pct":   ("FLOAT", {"default": 0.0,   "min": 0.0,   "max": 100.0, "step": 0.01, "tooltip": "% maxim pixeli zdrobiti (<5)"}),
+                "target_he":         ("FLOAT", {"default": 6.02,  "min": 0.0,   "max": 8.0,   "step": 0.01, "tooltip": "Histogram Entropy tinta"}),
+
+                "face_sigma":        ("FLOAT", {"default": 3.294, "min": 0.0, "max": 10.0,    "step": 0.001}),
+                "face_sharpness":    ("FLOAT", {"default": 2203.1,"min": 0.0, "max": 50000.0, "step": 0.1}),
+
+                "enforce_luminance":  (["yes", "no"], {"default": "yes"}),
+                "enforce_color":      (["yes", "no"], {"default": "yes"}),
+                "enforce_sharpness":  (["yes", "no"], {"default": "yes"}),
+                "enforce_burn_crush": (["yes", "no"], {"default": "yes"}),
+            }
+        }
+
+    RETURN_TYPES  = ("LATENT", "IMAGE", "STRING")
+    RETURN_NAMES  = ("latent", "image", "metrics_report")
+    FUNCTION      = "sample"
+    CATEGORY      = "sampling/advanced"
+    OUTPUT_NODE   = True
+
+    def sample(
+        self, model, positive, negative, latent_image, vae,
+        seed, steps, cfg, sampler_name, scheduler, denoise,
+        noise_sigma, noise_flatness, noise_wavelet, noise_skewness,
+        target_sharpness, target_tenengrad, target_laplacian, target_gradient,
+        target_snr_db, target_brisque, target_ssim, target_entropy,
+        target_dct_pct, target_compress,
+        color_r_sigma, color_g_sigma, color_b_sigma,
+        lum_mean, lum_std, max_burned_pct, max_crushed_pct, target_he,
+        face_sigma, face_sharpness,
+        enforce_luminance, enforce_color, enforce_sharpness, enforce_burn_crush,
+    ):
+        device  = model_management.get_torch_device()
+        latent  = latent_image.copy()
+        lat_smp = latent["samples"].to(device)
+
+        print(f"[AdvancedKSamplerPRO] Generez noise: sigma={noise_sigma} flat={noise_flatness} wav={noise_wavelet} sk={noise_skewness}")
+        noise = generate_structured_noise(
+            lat_smp.shape, seed,
+            noise_sigma, noise_flatness, noise_wavelet, noise_skewness,
+            device
+        )
+
+        print(f"[AdvancedKSamplerPRO] Sampling: {steps} steps, cfg={cfg}, {sampler_name}/{scheduler}")
+        samples = comfy.sample.sample(
+            model, noise, steps, cfg,
+            sampler_name, scheduler,
+            positive, negative, lat_smp,
+            denoise=denoise,
+            disable_noise=False,
+            start_step=None, last_step=None,
+            force_full_denoise=True,
+            noise_mask=latent.get("noise_mask"),
+            callback=None,
+            seed=seed,
+        )
+
+        latent_out            = latent.copy()
+        latent_out["samples"] = samples
+
+        decoded = vae.decode(samples)
+        img     = decoded[0].clone()
+
+        if enforce_luminance == "yes":
+            img = enforce_luminance(img, lum_mean, lum_std)
+
+        if enforce_color == "yes":
+            img = enforce_color_balance(img, color_r_sigma, color_g_sigma, color_b_sigma)
+
+        if enforce_sharpness == "yes":
+            img = enforce_sharpness(img, target_tenengrad)
+
+        if enforce_burn_crush == "yes":
+            img = enforce_burned_crushed(img, max_burned_pct, max_crushed_pct)
+
+        decoded[0] = img
+
+        m = compute_metrics(img)
+
+        def diff(target, actual, unit=""):
+            delta = actual - target
+            sign  = "+" if delta >= 0 else ""
+            return f"{actual:.2f}{unit} (tinta={target:.2f}{unit}, D={sign}{delta:.2f})"
+
+        H, W = img.shape[0], img.shape[1]
+
+        report = (
+            f"===========================================\n"
+            f"  AdvancedKSamplerPRO - Raport Metrici\n"
+            f"===========================================\n"
+            f"Rezolutie: {W}x{H}\n"
+            f"Noise: sigma={noise_sigma:.3f} | flat={noise_flatness:.3f} | wav={noise_wavelet:.3f} | sk={noise_skewness:.3f}\n\n"
+            f"SHARPNESS\n"
+            f"  Sharp  = {diff(target_sharpness, m['sharpness'])}\n"
+            f"  Ten    = {diff(target_tenengrad, m['tenengrad'])}\n"
+            f"  Lap    = {diff(target_laplacian, m['lap_var'])}\n"
+            f"  Grad   = {diff(target_gradient,  m['grad_mean'])}\n\n"
+            f"CALITATE\n"
+            f"  SNR    = {diff(target_snr_db, m['snr_db'], 'dB')}\n"
+            f"  Entrop = {diff(target_entropy, m['entropy_img'])}\n"
+            f"  DCT    = {diff(target_dct_pct, m['dct_pct'], '%')}\n\n"
+            f"CANALE RGB (sigma)\n"
+            f"  R = {diff(color_r_sigma, m['r_sig'])}\n"
+            f"  G = {diff(color_g_sigma, m['g_sig'])}\n"
+            f"  B = {diff(color_b_sigma, m['b_sig'])}\n\n"
+            f"LUMINANTA\n"
+            f"  Medie   = {diff(lum_mean, m['lum_mean'])}\n"
+            f"  Std     = {diff(lum_std,  m['lum_std'])}\n"
+            f"  Burned  = {m['burned']:.3f}%  (max={max_burned_pct:.3f}%)\n"
+            f"  Crushed = {m['crushed']:.3f}%  (max={max_crushed_pct:.3f}%)\n"
+            f"  HE      = {diff(target_he, m['entropy_hist'])}\n\n"
+            f"FACE: sigma={face_sigma:.3f}  sh={face_sharpness:.1f}\n"
+            f"===========================================\n"
+        )
+
+        print(report)
+        return (latent_out, decoded, report)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAPPINGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+NODE_CLASS_MAPPINGS = {
+    "AdvancedKSamplerPRO": AdvancedKSamplerPRO,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "AdvancedKSamplerPRO": "Advanced KSampler PRO",
+}
